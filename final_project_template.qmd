@@ -1,7 +1,7 @@
 ---
-title: "Your Title"
+title: "Diabetes Prediction and Risk Factors"
 subtitle: "BMIN503/EPID600 Final Project"
-author: "FirstName LastName"
+author: "David Smith"
 format: html
 editor: visual
 number-sections: true
@@ -15,6 +15,11 @@ Use this template to complete your project throughout the course. Your Final Pro
 ## Overview {#sec-overview}
 
 Give a brief a description of your project and its goal(s), what data you are using to complete it, and what two faculty/staff in different fields you have spoken to about your project with a brief summary of what you learned from each person. Include a link to your final project GitHub repository.
+
+
+The project aims to utilize the 2015 Behavioral Risk Factor Surveillance System (BRFSS) dataset to predict diabetes risk among individuals based on their responses to health-related survey questions. By analyzing these responses, the project seeks to determine the accuracy of using survey data to predict diabetes status and identify the most significant risk factors associated with the disease.
+
+
 
 ## Introduction {#sec-introduction}
 
