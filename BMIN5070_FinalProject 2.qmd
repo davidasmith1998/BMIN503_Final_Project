@@ -1,0 +1,694 @@
+---
+title: "BMIN5030 Final Project: Diabetes Prediction"
+format: html
+editor: visual
+editor_options: 
+  chunk_output_type: console
+---
+
+# Introduction
+
+Diabetes is a growing public health concern globally, affecting millions of individuals and contributing to a significant burden on healthcare systems. Early detection and management of diabetes are crucial to mitigating its complications. This project explores the use of predictive modeling techniques to identify individuals at risk of diabetes using the Behavioral Risk Factor Surveillance System (BRFSS) 2015 dataset.
+
+The dataset includes health indicators collected through surveys, offering insights into the behavioral, demographic, and clinical characteristics of respondents. By leveraging machine learning algorithms, this study aims to achieve the following objectives:
+
+1.  Predict the likelihood of diabetes based on survey responses.
+
+2.  Identify the most significant risk factors contributing to diabetes.
+
+3.  Evaluate and compare the performance of various machine learning models, focusing on metrics such as accuracy, ROC AUC, and Matthews Correlation Coefficient (MCC).
+
+The workflow combines data preprocessing, feature selection, exploratory data analysis, and model development using LightGBM. This document provides a step-by-step guide to the analytical process, from data cleaning to model evaluation.
+
+# Data Preprocessing
+
+```{r}
+# Load required libraries
+library(readxl)
+library(tidyverse)
+library(FNN)
+
+# Load the dataset
+diabetesdata <- read_excel("diabetes_012_health_indicators_BRFSS2015.xlsx")
+
+# Filter out rows with Diabetes_012 == 1 and rename the column
+diabetesdata <- diabetesdata %>%
+  filter(Diabetes_012 != 1) %>%
+  rename(Diabetes_binary = Diabetes_012)
+
+# Convert target into a factor
+diabetesdata$Diabetes_binary <- as.factor(diabetesdata$Diabetes_binary)
+
+```
+
+## Class Imbalance
+
+```{r}
+diabetesdata %>%
+  ggplot(aes(x = Diabetes_binary)) +
+  geom_bar() +
+  labs(
+    x = "Diabetes_binary",
+    y = "Count"
+  ) +
+  theme_minimal()
+```
+
+We have a significant class imbalance. Since the dataset is quiet large, down sampling the 'no diabetes' class is a viable approach for addressing the class imbalance.
+
+```{r}
+# Down-sample
+data_balanced <- diabetesdata %>%
+  group_by(Diabetes_binary) %>%
+  sample_n(size = min(table(diabetesdata$Diabetes_binary))) %>%
+  ungroup()
+
+
+```
+
+```{r}
+data_balanced %>%
+  ggplot(aes(x = Diabetes_binary)) +
+  geom_bar() +
+  labs(
+    x = "Diabetes_binary",
+    y = "Count"
+  ) +
+  theme_minimal()
+```
+
+# Exploratory Data Analysis
+
+Let's start with broad overview of the dataset using the skimr package.
+
+```{r}
+library(skimr)
+skim(data_balanced)
+```
+
+We have 21 numeric predictors in the dataset with no missing values. Let's check how many are binary predictors.
+
+```{r}
+# Count the number of binary variables in the dataset
+binary_variable_count <- sum(sapply(diabetesdata, function(column) {
+  is.numeric(column) && all(column %in% c(0, 1))
+}))
+
+cat("Number of binary variables:", binary_variable_count)
+
+```
+
+## Correlations
+
+Now let's check the spearman correlations between the predictors.
+
+```{r}
+library(reshape2)
+
+# Compute the correlation matrix
+correlation_matrix <- cor(data_balanced[,-1], use = "complete.obs",method = "spearman")
+
+# Melt the correlation matrix for ggplot
+melted_corr <- melt(correlation_matrix)
+
+# Create the heat map
+ggplot(melted_corr, aes(x = Var1, y = Var2, fill = value)) +
+  geom_tile(color = "white") +
+  scale_fill_gradient2(low = "blue", high = "red", mid = "white", 
+                       midpoint = 0, limit = c(-1, 1), space = "Lab", 
+                       name = "Correlation") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust = 1)) +
+  labs(title = "Correlation Heat Map",
+       x = "Features",
+       y = "Features") +
+  coord_fixed()
+```
+
+```{r}
+
+# Melt the correlation matrix
+melted_corr <- melt(correlation_matrix)
+
+# Remove self-correlations
+melted_corr <- melted_corr[melted_corr$Var1 != melted_corr$Var2, ]
+
+# Sort by absolute correlation values
+melted_corr <- melted_corr %>%
+  arrange(desc(abs(value)))
+
+# Get the top 5 positive correlations
+top_positive <- melted_corr %>%
+  filter(value > 0) %>%
+  head(5)
+
+# Get the top 5 negative correlations
+top_negative <- melted_corr %>%
+  filter(value < 0) %>%
+  head(5)
+
+cat("Top 5 Positive Correlations:\n")
+print(top_positive)
+
+cat("\nTop 5 Negative Correlations:\n")
+print(top_negative)
+
+```
+
+As we might expect physical health, general health, and difficulty walking all have a fairly high correlation with one another.
+
+## Diabetes Comparison Plots
+
+Now let's visualize how some of these predictors relate to the target variable, Diabetes_binary.
+
+```{r}
+# Relabel Diabetes_binary levels
+data_balanced$Diabetes_binary <- factor(
+  data_balanced$Diabetes_binary,
+  levels = c(0, 2),
+  labels = c("No Diabetes", "Diabetes")
+)
+
+# Calculate proportions within each GenHlth level
+genhlth_proportions <- data_balanced %>%
+  group_by(GenHlth, Diabetes_binary) %>%
+  summarize(Count = n(), .groups = "drop") %>%
+  group_by(GenHlth) %>%
+  mutate(Proportion = Count / sum(Count))
+
+# Plot proportions for GenHlth 
+ggplot(genhlth_proportions, aes(
+  x = factor(GenHlth, levels = 5:1,  
+             labels = c("Poor", "Fair", "Good", "Very Good", "Excellent")),
+  y = Proportion, fill = Diabetes_binary)) +
+  geom_bar(stat = "identity", position = "fill") +
+  labs(
+    x = "General Health (GenHlth)",
+    y = "Proportion",
+    fill = "Diabetes Status"
+  ) +
+  theme_minimal() +
+  scale_y_continuous(labels = scales::percent_format()) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+```
+
+```{r}
+# Calculate proportions within each Education level
+education_proportions <- data_balanced %>%
+  group_by(Education, Diabetes_binary) %>%
+  summarize(Count = n(), .groups = "drop") %>%
+  group_by(Education) %>%
+  mutate(Proportion = Count / sum(Count))
+
+# Define labels
+education_labels <- c(
+  "Never Attended School", "Elementary", "Junior High", "Senior High",
+  "Undergraduate", "Graduate"
+)
+
+# Plot proportions for Education
+ggplot(education_proportions, aes(x = factor(Education, levels = 1:6, labels = education_labels),
+                                  y = Proportion, fill = Diabetes_binary)) +
+  geom_bar(stat = "identity", position = "fill") +
+  labs(
+       x = "Education Level",
+       y = "Proportion",
+       fill = "Diabetes_binary") +
+  theme_minimal() +
+  scale_y_continuous(labels = scales::percent_format()) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+```
+
+```{r}
+# Calculate proportions within each HighBP level
+highbp_proportions <- data_balanced %>%
+  group_by(HighBP, Diabetes_binary) %>%
+  summarize(Count = n(), .groups = "drop") %>%
+  group_by(HighBP) %>%
+  mutate(Proportion = Count / sum(Count))
+
+# Plot proportions for HighBP
+ggplot(highbp_proportions, aes(x = factor(HighBP, levels = 0:1, labels = c("No", "Yes")),
+                               y = Proportion, fill = Diabetes_binary)) +
+  geom_bar(stat = "identity", position = "fill") +
+  labs(
+       x = "High Blood Pressure (HighBP)",
+       y = "Proportion",
+       fill = "Diabetes_binary") +
+  theme_minimal() +
+  scale_y_continuous(labels = scales::percent_format()) +
+  theme(axis.text.x = element_text(angle = 0, hjust = 0.5))
+
+```
+
+```{r}
+# Calculate proportions within each Age group
+age_proportions <- data_balanced %>%
+  group_by(Age, Diabetes_binary) %>%
+  summarize(Count = n(), .groups = "drop") %>%
+  group_by(Age) %>%
+  mutate(Proportion = Count / sum(Count))
+
+# Define labels
+age_labels <- c("18-24", "25-29", "30-34", "35-39", "40-44", "45-49", 
+                "50-54", "55-59", "60-64", "65-69", "70-74", "75-79", "80+")
+
+# Plot proportions for Age
+ggplot(age_proportions, aes(x = factor(Age, levels = 1:13, labels = age_labels),
+                            y = Proportion, fill = Diabetes_binary)) +
+  geom_bar(stat = "identity", position = "fill") +
+  labs(
+       x = "Age Group",
+       y = "Proportion",
+       fill = "Diabetes_binary") +
+  theme_minimal() +
+  scale_y_continuous(labels = scales::percent_format()) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+```
+
+```{r}
+# Calculate proportions within each CholCheck level
+cholcheck_proportions <- data_balanced %>%
+  group_by(CholCheck, Diabetes_binary) %>%
+  summarize(Count = n(), .groups = "drop") %>%
+  group_by(CholCheck) %>%
+  mutate(Proportion = Count / sum(Count))
+
+# Define labels
+cholcheck_labels <- c("No", "Yes")
+
+# Plot proportions for CholCheck
+ggplot(cholcheck_proportions, aes(x = factor(CholCheck, levels = 0:1, labels = cholcheck_labels),
+                                  y = Proportion, fill = Diabetes_binary)) +
+  geom_bar(stat = "identity", position = "fill") +
+  labs(
+    x = "Cholesterol Check Status",
+    y = "Proportion",
+    fill = "Diabetes Status"
+  ) +
+  theme_minimal() +
+  scale_y_continuous(labels = scales::percent_format()) +
+  theme(axis.text.x = element_text(angle = 0, hjust = 0.5))
+```
+
+```{r}
+# Calculate proportions within each Income group
+income_proportions <- data_balanced %>%
+  group_by(Income, Diabetes_binary) %>%
+  summarize(Count = n(), .groups = "drop") %>%
+  group_by(Income) %>%
+  mutate(Proportion = Count / sum(Count))
+
+# Define labels
+income_labels <- c(
+  "< $10k", "$10k-$15k", "$15k-$20k", "$20k-$25k",
+  "$25k-$35k", "$35k-$50k", "$50k-$75k", "≥ $75k"
+)
+
+# Plot proportions for Income
+ggplot(income_proportions, aes(x = factor(Income, levels = 1:8, labels = income_labels),
+                               y = Proportion, fill = Diabetes_binary)) +
+  geom_bar(stat = "identity", position = "fill") +
+  labs(
+       x = "Income Level",
+       y = "Proportion",
+       fill = "Diabetes_binary") +
+  theme_minimal() +
+  scale_y_continuous(labels = scales::percent_format()) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+```
+
+```{r}
+
+# Create the count plot
+ggplot(data_balanced, aes(x = BMI, fill = Diabetes_binary)) +
+  geom_bar(position = "dodge") +
+  scale_fill_manual(values = c("blue", "red")) +
+  labs(
+    x = "BMI",
+    y = "Count",
+    fill = "Diabetes Status"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(size = 20, face = "bold"),
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    legend.title = element_text(size = 14),
+    legend.text = element_text(size = 12)
+  )
+
+```
+
+There appear to be significant differences between the diabetes and no diabetes groups based on these predictors. In particular, general health appears to have a strong correlation with diabetes.
+
+## Unsupervised Analysis
+
+```{r}
+library(umap)
+
+
+# Take a random sample of 500 cases for each group
+data_subsample <- data_balanced %>%
+  group_by(Diabetes_binary) %>%
+  sample_n(size = 500) %>%
+  ungroup()
+
+# Extract Diabetes_binary for coloring
+diabetes_binary <- data_subsample$Diabetes_binary
+
+# Remove Diabetes_binary from the dataset for UMAP
+umap_data <- data_subsample %>%
+  select(-Diabetes_binary)
+
+# Scale the data
+scaled_data <- scale(umap_data)
+
+# Perform UMAP
+set.seed(42)
+umap_results <- umap(scaled_data, n_neighbors = 15, min_dist = 0.1, n_components = 2)
+
+# Extract UMAP embeddings
+umap_embeddings <- as.data.frame(umap_results$layout)
+colnames(umap_embeddings) <- c("UMAP1", "UMAP2")
+
+# Add Diabetes_binary back to UMAP results
+umap_embeddings$Diabetes_binary <- diabetes_binary
+
+# Plot with consistent labels
+ggplot(umap_embeddings, aes(x = UMAP1, y = UMAP2, color = Diabetes_binary)) +
+  geom_point(alpha = 0.7, size = 2) +  # Points
+  stat_ellipse(aes(fill = Diabetes_binary), geom = "polygon", alpha = 0.2, color = NA) +  # Transparent ellipses
+  scale_color_manual(values = c("red", "blue")) +
+  scale_fill_manual(values = c("red", "blue")) +
+  labs(
+    x = "UMAP Dimension 1",
+    y = "UMAP Dimension 2",
+    color = "Diabetes Status",
+    fill = "Diabetes Status"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(size = 16, face = "bold"),
+    legend.title = element_text(size = 12),
+    legend.text = element_text(size = 10)
+  )
+
+
+```
+
+There doesn't seem to be too much separation between people with and without diabetes. This might be a challenge for a predictive model.
+
+# Feature Selection
+
+Let's try to identify which features are most important for predicting whether a person has diabetes or not.
+
+```{r}
+library(gt)
+library(gridExtra)
+library(grid)
+
+
+# Split predictors (X) and target (Y)
+X <- data_balanced %>% select(-Diabetes_binary)  
+Y <- data_balanced$Diabetes_binary
+
+# Perform Chi-squared test for each feature
+chi_sq_results <- sapply(X, function(column) {
+  chisq.test(table(column, Y))$statistic
+})
+
+# Create a data frame with feature scores
+f_Scores <- data.frame(
+  Feature = names(chi_sq_results),
+  Score = chi_sq_results
+)
+
+# Sort the scores in descending order
+f_Scores <- f_Scores %>% arrange(desc(Score))
+
+# Create a publication-quality table for the top 10 features
+top_10_features <- f_Scores %>% head(10)
+
+gt_table <- top_10_features %>%
+  gt() %>%
+  tab_header(title = "Top 10 Features by Chi-Squared Score") %>%
+  fmt_number(columns = vars(Score), decimals = 2) %>%
+  cols_label(
+    Feature = "Feature Name",
+    Score = "Chi-Squared Score"
+  ) %>%
+  tab_style(
+    style = list(
+      cell_text(weight = "bold")
+    ),
+    locations = cells_column_labels(everything())
+  )
+
+grid.table(as.data.frame(top_10_features))
+
+```
+
+It looks like general health and high blood pressure are most associated with diabetes here.
+
+Now let's look at the odds ratios from a logistic regression model.
+
+```{r}
+# Load necessary libraries
+library(caret)
+library(broom)
+library(ggplot2)
+
+# Split the data into training and testing sets
+set.seed(123)
+train_index <- createDataPartition(data_balanced$Diabetes_binary, p = 0.75, list = FALSE)
+train_data <- data_balanced[train_index, ]
+test_data <- data_balanced[-train_index, ]
+
+# Fit a logistic regression model
+logistic_model <- glm(
+  Diabetes_binary ~ .,  # Include all predictors
+  data = train_data,
+  family = binomial
+)
+
+# Summarize the model
+summary(logistic_model)
+
+coefficients <- tidy(logistic_model, conf.int = TRUE)
+coefficients <- coefficients %>%
+  mutate(Odds_Ratio = exp(estimate), 
+         Lower_CI = exp(conf.low), 
+         Upper_CI = exp(conf.high))
+
+print(coefficients)
+
+# Plot odds ratios
+ggplot(coefficients, aes(x = reorder(term, Odds_Ratio), y = Odds_Ratio)) +
+  geom_point(color = "blue") +
+  geom_errorbar(aes(ymin = Lower_CI, ymax = Upper_CI), width = 0.2, color = "blue") +
+  coord_flip() +
+  labs(
+    title = "Odds Ratios and Confidence Intervals",
+    x = "Predictors",
+    y = "Odds Ratio"
+  ) +
+  theme_minimal()
+
+# Make predictions on the test set
+test_data <- test_data %>%
+  ungroup() %>%  
+  mutate(
+    Predicted_Probability = predict(logistic_model, newdata = test_data, type = "response"),
+    Predicted_Class = ifelse(Predicted_Probability > 0.5, "Diabetes", "No Diabetes")
+  )
+
+# Evaluate the model using a confusion matrix
+confusion <- confusionMatrix(
+  as.factor(test_data$Predicted_Class),
+  as.factor(test_data$Diabetes_binary)
+)
+print(confusion)
+
+# Plot ROC Curve
+library(pROC)
+roc_curve <- roc(test_data$Diabetes_binary, test_data$Predicted_Probability)
+plot(roc_curve, col = "blue", main = "ROC Curve")
+auc <- auc(roc_curve)
+cat("AUC:", auc, "\n")
+
+```
+
+Interesting! The CholCheck variable has the highest odds ratio by far. This variable represents people who have had their cholesterol checked within the past 5 years (yes or no).
+
+Finally, let's utilize the Boruta package to identify important variables.
+
+```{r}
+library(Boruta)
+
+set.seed(42)  
+boruta_result <- Boruta(
+  Diabetes_binary ~ .,  
+  data = data_balanced,
+  maxRuns = 11, 
+  doTrace = 2           
+)
+
+# Display the Boruta results
+print(boruta_result)
+
+# Plot the importance of variables
+plot(boruta_result, las = 2, cex.axis = 0.7)
+
+# Finalize the selection of important variables
+final_vars <- getSelectedAttributes(boruta_result, withTentative = TRUE)
+cat("Important Variables:\n", final_vars, "\n")
+
+# Display a detailed summary of results
+boruta_summary <- attStats(boruta_result)
+print(boruta_summary)
+```
+
+It looks like general health, BMI, high blood pressure, and age were most important for predicting diabetes. No doctor because of cost was least important and even lower than the shadow max importance provided by Boruta. As a result, we will drop this predictor before training the final predictive model.\
+\
+
+```{r}
+data_balanced<-data_balanced %>%
+  select(-NoDocbcCost)
+```
+
+# Predictive Model
+
+Let's train a light gradient boosting machine (LightGBM) using tidymodels. We can tune the hyper parameters using 10-fold cross validation.
+
+```{r}
+library(tidymodels)
+library(bonsai)
+library(future) 
+library(lightgbm)
+
+set.seed(123)
+
+
+
+# Split the data into training and testing sets
+data_split <- initial_split(data_balanced, prop = 3/4, strata = Diabetes_binary)
+train_data <- training(data_split)
+test_data  <- testing(data_split)
+
+# Create cross-validation folds
+cv_fold <- vfold_cv(train_data, v = 10, strata = "Diabetes_binary")
+
+# Create a recipe for preprocessing
+rec <- recipe(Diabetes_binary ~ ., data = train_data) %>%
+  step_YeoJohnson(all_numeric_predictors())  # Transform numeric features to reduce skew
+
+
+
+# LightGBM model specification
+lgbm_spec <- boost_tree(
+  trees = tune(),
+  tree_depth = tune(),
+  learn_rate = tune(),
+  mtry = tune(),
+  min_n = tune(),
+  loss_reduction = tune()
+) %>%
+  set_engine("lightgbm",
+             is_unbalance = TRUE, 
+             num_leaves = tune(),
+             nthread = future::availableCores()) %>%
+  set_mode("classification")
+
+# Combine recipe and model into a workflow
+wf <- workflow() %>%
+  add_model(lgbm_spec) %>%
+  add_recipe(rec)
+
+# Define tuning parameters
+lgbm_params <- wf %>%
+  extract_parameter_set_dials() %>%
+  update(
+    trees = trees(c(300, 1500)),
+    mtry = mtry(range = c(5, 21)),
+    min_n = min_n(range = c(30, 90)),
+    tree_depth = tree_depth(range = c(8, 25)),
+    learn_rate = learn_rate(range = c(-4, -1.5)), 
+    num_leaves = num_leaves(c(100, 1000))
+  ) %>%
+  finalize(train_data)
+
+# Control settings for tuning
+lgbm_ctrl <- control_grid(
+  verbose = TRUE,
+  save_pred = TRUE,
+  save_workflow = TRUE
+)
+
+# Perform hyperparameter tuning
+set.seed(123)
+lgbm_res <- tune_grid(
+  wf,
+  resamples = cv_fold,
+  grid = 20,
+  control = lgbm_ctrl,
+  # Choose metrics appropriate for classification
+  metrics = metric_set(accuracy, roc_auc, mcc),
+  param_info = lgbm_params
+)
+
+# View tuning results
+autoplot(lgbm_res)
+
+# Select the best hyperparameters by a chosen metric, e.g. "mcc"
+best_params <- select_best(lgbm_res, metric = "accuracy")
+
+# Finalize the workflow with the best hyperparameters
+final_wf <- finalize_workflow(wf, best_params)
+
+# Fit the final model to the entire training data
+set.seed(123)
+final_model <- fit(final_wf, data = train_data)
+
+# Generate predictions on the test set
+test_predictions <- predict(final_model, new_data = test_data, type = "class") %>%
+  bind_cols(predict(final_model, new_data = test_data, type = "prob")) %>%
+  bind_cols(test_data)
+
+# Calculate performance metrics
+metrics <- yardstick::metric_set(accuracy, mcc, roc_auc)
+test_metrics <- metrics(test_predictions, truth = Diabetes_binary, estimate = .pred_class, .pred_Diabetes)
+print(test_metrics)
+
+# Confusion matrix
+conf_mat <- conf_mat(test_predictions, truth = Diabetes_binary, estimate = .pred_class)
+autoplot(conf_mat, type = "heatmap") +
+  labs(title = "Confusion Matrix")
+
+# Extract underlying LightGBM model
+final_fit <- extract_fit_parsnip(final_model)
+
+# Get feature importance
+importance <- lightgbm::lgb.importance(final_fit$fit)
+
+# Convert to a data frame for plotting
+importance_df <- as.data.frame(importance)
+
+# Plot feature importance
+ggplot(importance_df, aes(x = reorder(Feature, Gain), y = Gain)) +
+  geom_bar(stat = "identity", fill = "steelblue") +
+  coord_flip() +
+  labs(title = "Feature Importance", x = "Predictors", y = "Gain") +
+  theme_minimal() +
+  theme(text = element_text(size = 14))
+
+```
+
+It looks like this model was barely an improvement from the simple logistic regression model we trained earlier. We can see that general health and high blood pressure were ranked as the most important variables for this model.
+
+# Conclusion
+
+Predicting diabetes from this dataset of survey questions proved to be challenging for the models we trained. Expanding the set of variables to include more demographic information may improve model performance. Overall, it seems like self-rated general health was the best indicator of whether or not a person has diabetes.
